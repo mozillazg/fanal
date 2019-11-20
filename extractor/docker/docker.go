@@ -2,6 +2,7 @@ package docker
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -170,7 +171,7 @@ func (d DockerExtractor) saveLocalImage(ctx context.Context, imageName string) (
 	return r, nil
 }
 
-func (d DockerExtractor) Extract(ctx context.Context, imageName string, filenames []string) (extractor.FileMap, error) {
+func (d DockerExtractor) Extract(ctx context.Context, imageName string, requiredFileNames []string) (extractor.FileMap, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), d.Option.Timeout)
 	defer cancel()
 
@@ -196,17 +197,19 @@ func (d DockerExtractor) Extract(ctx context.Context, imageName string, filename
 	for _, ref := range m.Manifest.Layers {
 		layerIDs = append(layerIDs, string(ref.Digest))
 		go func(dig digest.Digest) {
-			d.extractLayerWorker(dig, r, ctx, image, errCh, layerCh)
+			d.extractLayerWorker(dig, r, ctx, image, errCh, layerCh, requiredFileNames)
 		}(ref.Digest)
 	}
 
+	// TODO: This logic needs to go away, extractLayerWorker can do everything including extractLayerFiles
 	filesInLayers := map[string]extractor.FileMap{}
 	opqInLayers := map[string]extractor.OPQDirs{}
 	for i := 0; i < len(m.Manifest.Layers); i++ {
-		if filesInLayers, opqInLayers, err = d.extractLayerFiles(layerCh, errCh, ctx, filenames); err != nil {
+		if filesInLayers, opqInLayers, err = d.extractLayerFiles(layerCh, errCh, ctx, requiredFileNames); err != nil {
 			return nil, err
 		}
 	}
+	// END
 
 	fileMap, err := applyLayers(layerIDs, filesInLayers, opqInLayers)
 	if err != nil {
@@ -237,7 +240,7 @@ func downloadConfigFile(err error, r *registry.Registry, ctx context.Context, im
 	return config, nil
 }
 
-func (d DockerExtractor) extractLayerFiles(layerCh chan layer, errCh chan error, ctx context.Context, filenames []string) (map[string]extractor.FileMap, map[string]extractor.OPQDirs, error) {
+func (d DockerExtractor) extractLayerFiles(layerCh chan layer, errCh chan error, ctx context.Context, requiredFileNames []string) (map[string]extractor.FileMap, map[string]extractor.OPQDirs, error) {
 	filesInLayers := make(map[string]extractor.FileMap)
 	opqInLayers := make(map[string]extractor.OPQDirs)
 
@@ -249,7 +252,7 @@ func (d DockerExtractor) extractLayerFiles(layerCh chan layer, errCh chan error,
 	case <-ctx.Done():
 		return filesInLayers, opqInLayers, xerrors.Errorf("timeout: %w", ctx.Err())
 	}
-	files, opqDirs, err := d.ExtractFiles(l.Content, filenames)
+	files, opqDirs, err := d.ExtractFiles(l.Content, requiredFileNames)
 	if err != nil {
 		return filesInLayers, opqInLayers, xerrors.Errorf("failed to extract files: %w", err)
 	}
@@ -260,29 +263,56 @@ func (d DockerExtractor) extractLayerFiles(layerCh chan layer, errCh chan error,
 	return filesInLayers, opqInLayers, nil
 }
 
-func (d DockerExtractor) extractLayerWorker(dig digest.Digest, r *registry.Registry, ctx context.Context, image registry.Image, errCh chan error, layerCh chan layer) {
-	var rc io.Reader
-	// Use cache
-	rc = d.Cache.Get(string(dig))
-	if rc == nil {
-		// Download the layer.
-		layerRC, err := r.DownloadLayer(ctx, image.Path, dig)
-		if err != nil {
-			errCh <- xerrors.Errorf("failed to download the layer(%s): %w", dig, err)
-			return
-		}
+func (d DockerExtractor) extractLayerWorker(dig digest.Digest, r *registry.Registry,
+	ctx context.Context, image registry.Image, errCh chan error, layerCh chan layer, requiredFileNames []string) {
+	//var rc io.Reader
 
-		rc, err = d.Cache.Set(string(dig), layerRC)
-		if err != nil {
-			log.Print(err)
-		}
+	// Use cache
+	//rc = d.Cache.Get(string(dig))
+	//if rc == nil {
+	// Download the layer.
+	layerRC, err := r.DownloadLayer(ctx, image.Path, dig)
+	if err != nil {
+		errCh <- xerrors.Errorf("failed to download the layer(%s): %w", dig, err)
+		return
 	}
-	gzipReader, err := gzip.NewReader(rc)
+
+	// extract the layer from gzip to tar
+	layerTarData, err := gzip.NewReader(layerRC)
 	if err != nil {
 		errCh <- xerrors.Errorf("invalid gzip: %w", err)
 		return
 	}
-	layerCh <- layer{ID: dig, Content: gzipReader}
+
+	// get the file map from the layerTarData, ignore opqdirs
+	fm, _, err := d.ExtractFiles(layerTarData, requiredFileNames)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	// only save required files
+	for filename, contents := range fm {
+		//spew.Dump(contents)
+		//spew.Dump(filename)
+		if _, err := d.Cache.Set(filename, ioutil.NopCloser(bytes.NewReader(contents))); err != nil {
+			log.Printf("unable to save %s, err: %s\n", filename, err)
+		}
+	}
+
+	//rc, err = d.Cache.Set(string(dig), layerRC) // TODO: Delete this when ready
+	//if err != nil {
+	//	log.Print(err)
+	//}
+	//}
+
+	//gzipReader, err := gzip.NewReader(rc)
+	//if err != nil {
+	//	errCh <- xerrors.Errorf("invalid gzip: %w", err)
+	//	return
+	//}
+
+	layerCh <- layer{ID: dig, Content: layerTarData}
 }
 
 func getValidManifest(err error, r *registry.Registry, ctx context.Context, image registry.Image) (*schema2.DeserializedManifest, error) {
