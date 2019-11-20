@@ -11,6 +11,7 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aquasecurity/fanal/analyzer/library"
@@ -194,12 +195,21 @@ func (d DockerExtractor) Extract(ctx context.Context, imageName string, required
 	errCh := make(chan error)
 	var layerIDs []string
 
+	fileInLayersCh := make(chan map[string]extractor.FileMap, 100)
+	opqInLayersCh := make(chan map[string]extractor.OPQDirs, 100)
+	var wg sync.WaitGroup
+
 	for _, ref := range m.Manifest.Layers {
 		layerIDs = append(layerIDs, string(ref.Digest))
-		go func(dig digest.Digest) {
-			d.extractLayerWorker(dig, r, ctx, image, errCh, layerCh, requiredFileNames)
-		}(ref.Digest)
+		wg.Add(1)
+		go func(dig digest.Digest, wg *sync.WaitGroup) {
+			d.extractLayerWorker(dig, wg, r, ctx, image, errCh, layerCh, requiredFileNames, fileInLayersCh, opqInLayersCh)
+		}(ref.Digest, &wg)
 	}
+
+	wg.Wait()
+	close(fileInLayersCh)
+	close(opqInLayersCh)
 
 	// TODO: This logic needs to go away, extractLayerWorker can do everything including extractLayerFiles
 	filesInLayers := map[string]extractor.FileMap{}
@@ -263,8 +273,11 @@ func (d DockerExtractor) extractLayerFiles(layerCh chan layer, errCh chan error,
 	return filesInLayers, opqInLayers, nil
 }
 
-func (d DockerExtractor) extractLayerWorker(dig digest.Digest, r *registry.Registry,
-	ctx context.Context, image registry.Image, errCh chan error, layerCh chan layer, requiredFileNames []string) {
+func (d DockerExtractor) extractLayerWorker(dig digest.Digest, wg *sync.WaitGroup, r *registry.Registry,
+	ctx context.Context, image registry.Image, errCh chan error, layerCh chan layer, requiredFileNames []string,
+	fileCh chan map[string]extractor.FileMap, opqCh chan map[string]extractor.OPQDirs) {
+
+	defer wg.Done()
 	//var rc io.Reader
 
 	// Use cache
@@ -285,7 +298,7 @@ func (d DockerExtractor) extractLayerWorker(dig digest.Digest, r *registry.Regis
 	}
 
 	// get the file map from the layerTarData, ignore opqdirs
-	fm, _, err := d.ExtractFiles(layerTarData, requiredFileNames)
+	fm, opqdirs, err := d.ExtractFiles(layerTarData, requiredFileNames)
 	if err != nil {
 		log.Print(err)
 		return
@@ -312,7 +325,12 @@ func (d DockerExtractor) extractLayerWorker(dig digest.Digest, r *registry.Regis
 	//	return
 	//}
 
-	layerCh <- layer{ID: dig, Content: layerTarData}
+	//layerCh <- layer{ID: dig, Content: layerTarData}
+
+	fileCh <- map[string]extractor.FileMap{string(dig): fm}
+	opqCh <- map[string]extractor.OPQDirs{string(dig): opqdirs}
+	//wg.Done()
+	//return
 }
 
 func getValidManifest(err error, r *registry.Registry, ctx context.Context, image registry.Image) (*schema2.DeserializedManifest, error) {

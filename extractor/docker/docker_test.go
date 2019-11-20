@@ -10,6 +10,7 @@ import (
 	"path"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -380,32 +381,55 @@ func TestDocker_ExtractLayerWorker(t *testing.T) {
 	layerCh := make(chan layer)
 	errCh := make(chan error)
 
-	go func() {
-		de.extractLayerWorker(inputDigest, r, context.TODO(), inputImage, errCh, layerCh, requiredFileNames)
-	}()
+	numGoroutines := 2
 
-	var errRecieved error
-	var layerReceived layer
+	fileInLayersCh := make(chan map[string]extractor.FileMap, numGoroutines)
+	opqInLayersCh := make(chan map[string]extractor.OPQDirs, numGoroutines)
+	var wg sync.WaitGroup
 
-	select {
-	case errRecieved = <-errCh:
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(wg *sync.WaitGroup) {
+			de.extractLayerWorker(inputDigest, wg, r, context.TODO(), inputImage, errCh, layerCh, requiredFileNames, fileInLayersCh, opqInLayersCh)
+		}(&wg)
+	}
+
+	fmt.Println("waiting for workers to finish")
+	wg.Wait()
+	close(fileInLayersCh)
+	close(opqInLayersCh)
+	close(errCh)
+	fmt.Println("workers finished")
+
+	var fileMapReceived map[string]extractor.FileMap
+	var opqDirMapReceived map[string]extractor.OPQDirs
+
+	if len(errCh) > 0 {
+		errRecieved := <-errCh
 		assert.FailNow(t, "unexpected error received, err: ", errRecieved)
-	case layerReceived = <-layerCh:
-		assert.Equal(t, inputDigest, layerReceived.ID)
-		fm, opqdirs, err := de.ExtractFiles(layerReceived.Content, requiredFileNames)
-		assert.NoError(t, err)
-		assert.Empty(t, opqdirs)
-		assert.Equal(t, extractor.FileMap{"foo": []byte("bar")}, fm)
-		// TODO: Add assertion for content received
+	}
+
+	for i := 0; i < numGoroutines; i++ {
+		fileMapReceived = <-fileInLayersCh
+		assert.Equal(t, map[string]extractor.FileMap{
+			"sha256:62d8908bee94c202b2d35224a221aaa2058318bfa9879fa541efaecba272331b": {
+				"testdir/badworld.txt":   {0x62, 0x61, 0x64, 0x20, 0x77, 0x6f, 0x72, 0x6c, 0x64, 0xa},
+				"testdir/helloworld.txt": {0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x77, 0x6f, 0x72, 0x6c, 0x64, 0xa},
+			},
+		}, fileMapReceived)
+		opqDirMapReceived = <-opqInLayersCh
+		assert.Equal(t, map[string]extractor.OPQDirs{
+			"sha256:62d8908bee94c202b2d35224a221aaa2058318bfa9879fa541efaecba272331b": {},
+		}, opqDirMapReceived)
 	}
 
 	// TODO: Add assertion for checking what's inside the cache
-	//files, _ := ioutil.ReadDir(tempCacheDir)
-	//for _, file := range files {
-	//	fmt.Println("file: ", file.Name())
-	//	c, _ := ioutil.ReadFile(file.Name())
-	//	fmt.Println("file contents: ", string(c))
-	//}
+	files, _ := ioutil.ReadDir(tempCacheDir)
+	for _, file := range files {
+		fmt.Println("file: ", file.Name())
+		c, _ := ioutil.ReadFile(file.Name())
+		fmt.Println("file contents: ", string(c))
+	}
 
 	// check cache for stored file
 	//actualCacheFile := de.Cache.Get(string(inputDigest))
