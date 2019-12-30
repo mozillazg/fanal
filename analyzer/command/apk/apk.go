@@ -51,7 +51,7 @@ type pkg struct {
 type version map[string]int
 
 const (
-	apkIndexArchiveURL = "https://raw.githubusercontent.com/knqyf263/apkIndex-archive/master/alpine/v%s/main/x86_64/history.json"
+	apkIndexArchiveURL = "https://cdn.jsdelivr.net/gh/knqyf263/apkIndex-archive@master/alpine/v%s/main/x86_64/history.json"
 )
 
 var (
